@@ -1,299 +1,113 @@
 import os
-import time
-import sqlite3
+import asyncio
 import logging
-import traceback
+import sqlite3
+from aiogram import Bot, Dispatcher, types
+from aiogram.filters import Command
+from aiogram.types import Message
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import (
-    Application,
-    CommandHandler,
-    CallbackQueryHandler,
-    MessageHandler,
-    ConversationHandler,
-    ContextTypes,
-    filters,
-)
+# =====================
+# SAFETY CONFIG
+# =====================
 
-# =========================
-# CONFIG (SAFE)
-# =========================
+BOT_TOKEN = os.getenv("BOT_TOKEN")
 
-BOT_TOKEN = os.getenv("BOT_TOKEN", "PUT_TOKEN_HERE")
+if not BOT_TOKEN:
+    raise RuntimeError("❌ BOT_TOKEN не знайдено в env")
+
 ADMIN_ID = 5959832681
 
-FACTIONS = {
-    "ДБР": -5042162172,
-    "НПС": -1003797046749,
-    "СБС": -5173873867,
-    "НАБС": -5156309034,
-}
-
-QUESTIONS = [
-    "XP у поліції?",
-    "Досвід роботи?",
-    "Активність (1-10)?",
-    "Адекватність (1-10)?",
-    "Ім'я?",
-    "Вік?",
-    "Чому хочеш вступити?",
-]
-
-logging.basicConfig(level=logging.INFO)
-
-# =========================
-# DB SAFE INIT
-# =========================
-
-conn = sqlite3.connect("bot.db", check_same_thread=False)
-cur = conn.cursor()
-
-cur.execute("""
-CREATE TABLE IF NOT EXISTS applications (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    user_id INTEGER,
-    username TEXT,
-    faction TEXT,
-    data TEXT,
-    status TEXT DEFAULT 'pending'
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s"
 )
-""")
-conn.commit()
 
-# =========================
-# ANTI-SPAM
-# =========================
+# =====================
+# BOT INIT
+# =====================
 
-cooldowns = {}
-COOLDOWN = 20
+bot = Bot(token=BOT_TOKEN)
+dp = Dispatcher()
 
-def anti_spam(uid):
-    now = time.time()
-    if uid in cooldowns and now - cooldowns[uid] < COOLDOWN:
-        return False
-    cooldowns[uid] = now
-    return True
+# =====================
+# DB SAFE INIT
+# =====================
 
-# =========================
-# STATES
-# =========================
-
-CHOOSE, ANSWER = range(2)
-
-# =========================
-# SAFE START
-# =========================
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        uid = update.effective_user.id
-
-        if not anti_spam(uid):
-            await update.message.reply_text("⏳ Антиспам активний")
-            return ConversationHandler.END
-
-        keyboard = [
-            [InlineKeyboardButton("🔎 ДБР", callback_data="ДБР"),
-             InlineKeyboardButton("👮 НПС", callback_data="НПС")],
-            [InlineKeyboardButton("🛡 СБС", callback_data="СБС"),
-             InlineKeyboardButton("⚖️ НАБС", callback_data="НАБС")],
-        ]
-
-        await update.message.reply_text(
-            "🔥 Обери фракцію:",
-            reply_markup=InlineKeyboardMarkup(keyboard),
+def init_db():
+    conn = sqlite3.connect("bot.db")
+    cur = conn.cursor()
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS logs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            text TEXT
         )
+    """)
+    conn.commit()
+    return conn
 
-        return CHOOSE
+conn = init_db()
 
-    except Exception:
-        traceback.print_exc()
-        return ConversationHandler.END
+# =====================
+# SAFE EXEC WRAPPER (АНТИ-КРАШ)
+# =====================
 
-
-# =========================
-# CHOOSE FACTION
-# =========================
-
-async def choose(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        q = update.callback_query
-        await q.answer()
-
-        context.user_data["faction"] = q.data
-        context.user_data["answers"] = []
-        context.user_data["i"] = 0
-
-        await q.edit_message_text(f"📋 Починаємо анкету {q.data}\n\n{QUESTIONS[0]}")
-
-        return ANSWER
-
-    except Exception:
-        traceback.print_exc()
-        return ConversationHandler.END
-
-
-# =========================
-# ANSWERS FLOW
-# =========================
-
-async def answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        text = update.message.text
-
-        i = context.user_data.get("i", 0)
-        answers = context.user_data.get("answers", [])
-
-        answers.append(text)
-        i += 1
-
-        context.user_data["i"] = i
-        context.user_data["answers"] = answers
-
-        if i < len(QUESTIONS):
-            await update.message.reply_text(QUESTIONS[i])
-            return ANSWER
-
-        # =========================
-        # FINAL SAFE BUILD
-        # =========================
-
-        faction = context.user_data.get("faction", "UNKNOWN")
-        user = update.effective_user
-
-        msg = f"📩 НОВА ЗАЯВКА ({faction})\n"
-        msg += f"User: @{user.username or 'no_username'}\n\n"
-
-        for q, a in zip(QUESTIONS, answers):
-            msg += f"{q}\n➡️ {a}\n\n"
-
-        # save DB safely
+def safe(func):
+    async def wrapper(*args, **kwargs):
         try:
-            cur.execute(
-                "INSERT INTO applications (user_id, username, faction, data) VALUES (?, ?, ?, ?)",
-                (user.id, user.username, faction, str(answers))
-            )
-            conn.commit()
-            app_id = cur.lastrowid
-        except Exception:
-            traceback.print_exc()
-            app_id = 0
+            return await func(*args, **kwargs)
+        except Exception as e:
+            logging.error(f"Handler error: {e}")
+    return wrapper
 
-        # admin buttons
-        keyboard = InlineKeyboardMarkup([
-            [
-                InlineKeyboardButton("✅ Accept", callback_data=f"acc_{app_id}"),
-                InlineKeyboardButton("❌ Reject", callback_data=f"rej_{app_id}")
-            ]
-        ])
+# =====================
+# HANDLERS
+# =====================
 
-        # send to faction SAFE
-        try:
-            chat_id = FACTIONS.get(faction)
-            if chat_id:
-                await context.bot.send_message(chat_id, msg)
-        except Exception:
-            traceback.print_exc()
+@dp.message(Command("start"))
+@safe
+async def start(message: Message):
+    await message.answer(
+        "🔥 Бот працює стабільно\n"
+        "Напиши щось"
+    )
 
-        # send to admin SAFE
-        try:
-            await context.bot.send_message(ADMIN_ID, msg, reply_markup=keyboard)
-        except Exception:
-            traceback.print_exc()
+@dp.message()
+@safe
+async def echo(message: Message):
+    text = message.text
 
-        await update.message.reply_text("✅ Заявку відправлено!")
-
-        return ConversationHandler.END
-
-    except Exception:
-        traceback.print_exc()
-        return ConversationHandler.END
-
-
-# =========================
-# ADMIN PANEL SAFE
-# =========================
-
-async def admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # save safely
     try:
-        q = update.callback_query
-        await q.answer()
-
-        if update.effective_user.id != ADMIN_ID:
-            return
-
-        data = q.data
-        action, app_id = data.split("_")
-
-        status = "accepted" if action == "acc" else "rejected"
-
-        try:
-            cur.execute("UPDATE applications SET status=? WHERE id=?", (status, app_id))
-            conn.commit()
-        except Exception:
-            traceback.print_exc()
-
-        await q.edit_message_text(f"📌 APP #{app_id}\nSTATUS: {status}")
-
-    except Exception:
-        traceback.print_exc()
-
-
-# =========================
-# STATS
-# =========================
-
-async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        if update.effective_user.id != ADMIN_ID:
-            return
-
-        cur.execute("SELECT status FROM applications")
-        rows = cur.fetchall()
-
-        total = len(rows)
-        acc = len([r for r in rows if r[0] == "accepted"])
-        rej = len([r for r in rows if r[0] == "rejected"])
-
-        await update.message.reply_text(
-            f"📊 STATS\n\nTotal: {total}\nAccepted: {acc}\nRejected: {rej}"
+        cur = conn.cursor()
+        cur.execute(
+            "INSERT INTO logs (user_id, text) VALUES (?, ?)",
+            (message.from_user.id, text)
         )
+        conn.commit()
+    except Exception as e:
+        logging.error(f"DB error: {e}")
 
-    except Exception:
-        traceback.print_exc()
+    await message.answer(f"✔️ Отримав: {text}")
 
+# =====================
+# GLOBAL ERROR PROTECTION
+# =====================
 
-# =========================
-# MAIN SAFE CORE
-# =========================
+async def on_startup():
+    logging.info("🚀 BOT STARTED SUCCESSFULLY")
 
-def main():
-    if not BOT_TOKEN or BOT_TOKEN == "PUT_TOKEN_HERE":
-        print("❌ BOT TOKEN NOT SET")
-        return
-
+async def main():
     try:
-        app = Application.builder().token(BOT_TOKEN).build()
-
-        conv = ConversationHandler(
-            entry_points=[CommandHandler("start", start)],
-            states={
-                CHOOSE: [CallbackQueryHandler(choose)],
-                ANSWER: [MessageHandler(filters.TEXT & ~filters.COMMAND, answer)],
-            },
-            fallbacks=[],
+        await dp.start_polling(
+            bot,
+            skip_updates=True,
+            on_startup=on_startup
         )
-
-        app.add_handler(conv)
-        app.add_handler(CallbackQueryHandler(admin))
-        app.add_handler(CommandHandler("stats", stats))
-
-        print("🔥 ULTRA BOT RUNNING 24/7 SAFE MODE")
-        app.run_polling(drop_pending_updates=True)
-
-    except Exception:
-        traceback.print_exc()
-
+    except Exception as e:
+        logging.critical(f"FATAL CRASH PREVENTED: {e}")
+        await asyncio.sleep(3)
+        await main()  # auto-restart loop
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
