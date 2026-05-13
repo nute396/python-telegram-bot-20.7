@@ -1,56 +1,42 @@
 import os
-import asyncio
-import logging
+import time
 import sqlite3
-import traceback
+import logging
 
-from aiogram import Bot, Dispatcher, types
+from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
-from aiogram.types import Message, CallbackQuery
-from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 # =====================
 # CONFIG
 # =====================
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
+
 ADMIN_ID = 5959832681
 
 FACTIONS = ["ДБР", "НПС", "СБС", "НАБС"]
 
 QUESTIONS = [
-    "XP у поліції?",
-    "Досвід роботи?",
-    "Активність (1-10)?",
-    "Адекватність (1-10)?",
-    "Ім'я?",
-    "Вік?",
-    "Чому хочеш вступити?"
+    "📊 XP у фракції / грі:",
+    "💼 Досвід роботи:",
+    "⚡ Активність (1-10):",
+    "🧠 Адекватність (1-10):",
+    "👤 Ім'я:",
+    "🎂 Вік:",
+    "❓ Чому хочеш вступити?",
 ]
-
-logging.basicConfig(level=logging.INFO)
-
-if not BOT_TOKEN:
-    raise RuntimeError("BOT_TOKEN not set")
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
+
+logging.basicConfig(level=logging.INFO)
 
 # =====================
 # DB
 # =====================
 
-conn = sqlite3.connect("rpg.db", check_same_thread=False)
+conn = sqlite3.connect("apps.db")
 cur = conn.cursor()
-
-cur.execute("""
-CREATE TABLE IF NOT EXISTS users (
-    user_id INTEGER PRIMARY KEY,
-    xp INTEGER DEFAULT 0,
-    level INTEGER DEFAULT 1,
-    faction TEXT DEFAULT NULL
-)
-""")
 
 cur.execute("""
 CREATE TABLE IF NOT EXISTS applications (
@@ -62,163 +48,154 @@ CREATE TABLE IF NOT EXISTS applications (
 )
 """)
 
+cur.execute("""
+CREATE TABLE IF NOT EXISTS users (
+    user_id INTEGER PRIMARY KEY,
+    step INTEGER DEFAULT 0,
+    answers TEXT DEFAULT '',
+    faction TEXT DEFAULT ''
+)
+""")
+
 conn.commit()
 
 # =====================
-# LEVEL SYSTEM
+# ANTI SPAM
 # =====================
 
-def add_xp(user_id, amount=10):
-    cur.execute("SELECT xp, level FROM users WHERE user_id=?", (user_id,))
-    row = cur.fetchone()
+cooldowns = {}
+COOLDOWN = 3
 
-    if not row:
-        cur.execute("INSERT INTO users (user_id, xp, level) VALUES (?, 0, 1)", (user_id,))
-        conn.commit()
-        return
-
-    xp, level = row
-    xp += amount
-
-    if xp >= level * 100:
-        level += 1
-        xp = 0
-
-    cur.execute(
-        "UPDATE users SET xp=?, level=? WHERE user_id=?",
-        (xp, level, user_id)
-    )
-    conn.commit()
+def anti_spam(uid):
+    now = time.time()
+    if uid in cooldowns and now - cooldowns[uid] < COOLDOWN:
+        return False
+    cooldowns[uid] = now
+    return True
 
 # =====================
-# START RPG PROFILE
+# START
 # =====================
 
 @dp.message(Command("start"))
-async def start(message: Message):
-    uid = message.from_user.id
+async def start(message: types.Message):
+    if not anti_spam(message.from_user.id):
+        return
 
-    cur.execute("INSERT OR IGNORE INTO users (user_id) VALUES (?)", (uid,))
-    conn.commit()
-
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📋 Подати заявку", callback_data="apply")],
-        [InlineKeyboardButton(text="👤 Профіль", callback_data="profile")]
-    ])
-
-    await message.answer("⚔️ RPG БОТ ВІТАЄ\nОбери дію:", reply_markup=kb)
-
-# =====================
-# PROFILE
-# =====================
-
-@dp.callback_query(lambda c: c.data == "profile")
-async def profile(call: CallbackQuery):
-    uid = call.from_user.id
-
-    cur.execute("SELECT xp, level, faction FROM users WHERE user_id=?", (uid,))
-    row = cur.fetchone()
-
-    xp, level, faction = row
-
-    await call.message.edit_text(
-        f"👤 Профіль\n\n"
-        f"⭐ Level: {level}\n"
-        f"⚡ XP: {xp}/100\n"
-        f"🏛 Фракція: {faction or 'немає'}"
+    kb = types.ReplyKeyboardMarkup(
+        keyboard=[[types.KeyboardButton(text=f)] for f in FACTIONS],
+        resize_keyboard=True
     )
 
+    await message.answer("🔥 ОФІЦІЙНА СИСТЕМА ЗАЯВОК\n\nОберіть фракцію:", reply_markup=kb)
+
 # =====================
-# APPLY SYSTEM
+# HANDLE FACTION + FLOW
 # =====================
 
-user_state = {}
+@dp.message(F.text.in_(FACTIONS))
+async def choose_faction(message: types.Message):
+    user_id = message.from_user.id
 
-@dp.callback_query(lambda c: c.data == "apply")
-async def apply(call: CallbackQuery):
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=f, callback_data=f"f_{f}")]
-        for f in FACTIONS
-    ])
+    cur.execute(
+        "INSERT OR IGNORE INTO users (user_id) VALUES (?)",
+        (user_id,)
+    )
 
-    await call.message.edit_text("🏛 Обери фракцію:", reply_markup=kb)
+    cur.execute(
+        "UPDATE users SET faction=?, step=1, answers='' WHERE user_id=?",
+        (message.text, user_id)
+    )
+    conn.commit()
 
-@dp.callback_query(lambda c: c.data.startswith("f_"))
-async def faction(call: CallbackQuery):
-    faction = call.data[2:]
-    uid = call.from_user.id
-
-    user_state[uid] = {
-        "faction": faction,
-        "answers": [],
-        "q": 0
-    }
-
-    await call.message.edit_text(f"📋 Анкета {faction}\n\n{QUESTIONS[0]}")
+    await message.answer(f"📋 Фракція обрана: {message.text}\n\n{QUESTIONS[0]}")
 
 # =====================
 # ANSWERS FLOW
 # =====================
 
 @dp.message()
-async def answers(message: Message):
-    uid = message.from_user.id
+async def answers(message: types.Message):
+    user_id = message.from_user.id
+    text = message.text
 
-    if uid not in user_state:
-        add_xp(uid, 5)
+    cur.execute("SELECT step, answers, faction FROM users WHERE user_id=?", (user_id,))
+    row = cur.fetchone()
+
+    if not row:
         return
 
-    state = user_state[uid]
+    step, answers, faction = row
 
-    state["answers"].append(message.text)
-    state["q"] += 1
-
-    add_xp(uid, 10)
-
-    if state["q"] < len(QUESTIONS):
-        await message.answer(QUESTIONS[state["q"]])
+    if step == 0:
         return
 
-    faction = state["faction"]
-    answers = state["answers"]
+    answers = answers.split("|") if answers else []
+    answers.append(text)
 
+    step += 1
+
+    # next question
+    if step <= len(QUESTIONS):
+        cur.execute(
+            "UPDATE users SET step=?, answers=? WHERE user_id=?",
+            (step, "|".join(answers), user_id)
+        )
+        conn.commit()
+
+        if step < len(QUESTIONS):
+            await message.answer(QUESTIONS[step - 1])
+            return
+
+    # FINISH APPLICATION
     cur.execute(
         "INSERT INTO applications (user_id, faction, data) VALUES (?, ?, ?)",
-        (uid, faction, str(answers))
+        (user_id, faction, "|".join(answers))
     )
     conn.commit()
 
     app_id = cur.lastrowid
 
-    text = f"📩 ЗАЯВКА #{app_id}\n🏛 {faction}\n\n"
-    for q, a in zip(QUESTIONS, answers):
-        text += f"{q}\n➡️ {a}\n\n"
+    # format msg
+    msg = f"📩 НОВА ЗАЯВКА #{app_id}\n\n"
+    msg += f"🏷 Фракція: {faction}\n\n"
 
-    kb = InlineKeyboardMarkup(inline_keyboard=[
+    for q, a in zip(QUESTIONS, answers):
+        msg += f"{q}\n➡️ {a}\n\n"
+
+    # admin buttons
+    kb = types.InlineKeyboardMarkup(inline_keyboard=[
         [
-            InlineKeyboardButton(text="✅ Accept", callback_data=f"a_{app_id}"),
-            InlineKeyboardButton(text="❌ Reject", callback_data=f"r_{app_id}")
+            types.InlineKeyboardButton(text="✅ Accept", callback_data=f"acc_{app_id}"),
+            types.InlineKeyboardButton(text="❌ Reject", callback_data=f"rej_{app_id}")
         ]
     ])
 
-    await message.answer("📨 Заявку відправлено!")
+    await bot.send_message(ADMIN_ID, msg, reply_markup=kb)
+    await message.answer("✅ Заявку відправлено! Очікуй рішення.")
 
-    await bot.send_message(ADMIN_ID, text, reply_markup=kb)
-
-    del user_state[uid]
+    # reset user
+    cur.execute("UPDATE users SET step=0, answers='' WHERE user_id=?", (user_id,))
+    conn.commit()
 
 # =====================
-# ADMIN
+# ADMIN PANEL
 # =====================
 
-@dp.callback_query(lambda c: c.data.startswith("a_") or c.data.startswith("r_"))
-async def admin(call: CallbackQuery):
+@dp.callback_query()
+async def admin(call: types.CallbackQuery):
     if call.from_user.id != ADMIN_ID:
         return
 
-    action, app_id = call.data.split("_")
+    data = call.data
+    action, app_id = data.split("_")
 
-    status = "accepted" if action == "a" else "rejected"
+    if action == "acc":
+        status = "accepted"
+        text = "✅ ACCEPTED"
+    else:
+        status = "rejected"
+        text = "❌ REJECTED"
 
     cur.execute(
         "UPDATE applications SET status=? WHERE id=?",
@@ -226,27 +203,17 @@ async def admin(call: CallbackQuery):
     )
     conn.commit()
 
-    await call.message.edit_text(f"{status.upper()} #{app_id}")
+    await call.message.edit_text(f"{text}\n\nAPP #{app_id}")
+    await call.answer()
 
 # =====================
-# SAFE RUN
+# RUN
 # =====================
 
 async def main():
-    while True:
-        try:
-            logging.info("🚀 RPG BOT STARTED")
-
-            await dp.start_polling(
-                bot,
-                skip_updates=True
-            )
-
-        except Exception as e:
-            logging.error("💥 CRASH - RESTART")
-            logging.error(e)
-            logging.error(traceback.format_exc())
-            await asyncio.sleep(3)
+    logging.basicConfig(level=logging.INFO)
+    await dp.start_polling(bot)
 
 if __name__ == "__main__":
+    import asyncio
     asyncio.run(main())
