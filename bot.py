@@ -18,7 +18,7 @@ from telegram.ext import (
 # =====================
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-ADMIN_ID = 123456789  # <-- твій Telegram ID
+ADMIN_ID =  5959832681 # <-- твій Telegram ID
 
 FACTIONS = {
     "ДБР": -5042162172,
